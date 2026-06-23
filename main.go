@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -84,6 +87,41 @@ func humanSize(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
+// parseSize parses a human-readable size like "10MB", "500K", "1.5G", "1024".
+// Plain numbers are bytes. Returns 0 for an empty string.
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	if s == "" {
+		return 0, nil
+	}
+	i := 0
+	for i < len(s) && (s[i] == '.' || (s[i] >= '0' && s[i] <= '9')) {
+		i++
+	}
+	num := s[:i]
+	unit := strings.TrimSpace(s[i:])
+	val, err := strconv.ParseFloat(num, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size: %s", s)
+	}
+	var mult float64 = 1
+	switch unit {
+	case "", "B":
+		mult = 1
+	case "K", "KB", "KIB":
+		mult = 1 << 10
+	case "M", "MB", "MIB":
+		mult = 1 << 20
+	case "G", "GB", "GIB":
+		mult = 1 << 30
+	case "T", "TB", "TIB":
+		mult = 1 << 40
+	default:
+		return 0, fmt.Errorf("invalid size unit: %s", unit)
+	}
+	return int64(val * mult), nil
+}
+
 // --- styles ---
 var (
 	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).MarginBottom(1)
@@ -118,6 +156,7 @@ type scanDoneMsg struct {
 type model struct {
 	root     string
 	maxLevel int     // deepest level scanned (>= 1)
+	minSize  int64   // hide nodes smaller than this
 	roots    []*node // top-level nodes
 	cursor   int
 	offset   int // index of first visible row (scroll position)
@@ -129,11 +168,11 @@ type model struct {
 	total    int64
 }
 
-func initialModel(root string, maxLevel int) model {
+func initialModel(root string, maxLevel int, minSize int64) model {
 	s := spinner.New()
 	s.Spinner = spinner.Dot
 	s.Style = cursorStyle
-	return model{root: root, maxLevel: maxLevel, loading: true, spin: s}
+	return model{root: root, maxLevel: maxLevel, minSize: minSize, loading: true, spin: s}
 }
 
 func (m model) Init() tea.Cmd {
@@ -149,6 +188,9 @@ func (m model) flatten() []*node {
 	var walk func(ns []*node)
 	walk = func(ns []*node) {
 		for _, n := range ns {
+			if n.size < m.minSize {
+				break // sorted largest-first: rest are smaller too
+			}
 			out = append(out, n)
 			if n.isDir && n.expanded {
 				walk(n.children)
@@ -315,33 +357,136 @@ func (m model) View() string {
 	return b
 }
 
+// outNode is the JSON/serializable form of a node.
+type outNode struct {
+	Name     string    `json:"name"`
+	Path     string    `json:"path"`
+	Size     int64     `json:"size"`
+	IsDir    bool      `json:"is_dir"`
+	Children []outNode `json:"children,omitempty"`
+}
+
+// report is the top-level JSON document.
+type report struct {
+	Root  string    `json:"root"`
+	Total int64     `json:"total"`
+	Items []outNode `json:"items"`
+}
+
+// toOut converts a node tree to outNodes, dropping entries below minSize.
+func toOut(nodes []*node, minSize int64) []outNode {
+	var out []outNode
+	for _, n := range nodes {
+		if n.size < minSize {
+			break // sorted largest-first
+		}
+		o := outNode{Name: n.name, Path: n.path, Size: n.size, IsDir: n.isDir}
+		if n.isDir {
+			o.Children = toOut(n.children, minSize)
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
+// printPlain writes the tree as an indented plain-text listing.
+func printPlain(w io.Writer, root string, total, minSize int64, nodes []*node) {
+	fmt.Fprintf(w, "%s\t%s total\n", root, humanSize(total))
+	var walk func(ns []*node, depth int)
+	walk = func(ns []*node, depth int) {
+		for _, n := range ns {
+			if n.size < minSize {
+				break
+			}
+			name := n.name
+			if n.isDir {
+				name += string(os.PathSeparator)
+			}
+			fmt.Fprintf(w, "%s%s\t%s\n", strings.Repeat("  ", depth), name, humanSize(n.size))
+			if n.isDir {
+				walk(n.children, depth+1)
+			}
+		}
+	}
+	walk(nodes, 1)
+}
+
 // version is injected at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
+const usageText = `pathsize %s
+
+Usage: pathsize [flags] [path] [depth]
+
+  path    directory to scan (default ".")
+  depth   levels to expand, integer >= 1 (default 2)
+
+Flags:
+  -v, --version      print version and exit
+  -h, --help         print this help and exit
+      --no-tui       print results as plain text instead of the TUI
+      --json         print results as JSON (implies --no-tui)
+      --min-size S   hide entries smaller than S (e.g. 10MB, 500K, 1.5G)
+
+Note: flags must come before the positional path/depth arguments.
+`
+
 func main() {
-	root := "."
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "-v", "--version", "version":
-			fmt.Printf("pathsize %s\n", version)
-			return
-		case "-h", "--help", "help":
-			fmt.Printf("pathsize %s\n\nUsage: pathsize [path] [depth]\n  path   directory to scan (default \".\")\n  depth  levels to expand, integer >= 1 (default 2)\n", version)
+	fs := flag.NewFlagSet("pathsize", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.Usage = func() { fmt.Fprintf(os.Stderr, usageText, version) }
+
+	showVer := fs.Bool("v", false, "print version and exit")
+	showVer2 := fs.Bool("version", false, "print version and exit")
+	noTUI := fs.Bool("no-tui", false, "print results as plain text instead of the TUI")
+	jsonOut := fs.Bool("json", false, "print results as JSON (implies --no-tui)")
+	minSizeStr := fs.String("min-size", "", "hide entries smaller than this (e.g. 10MB)")
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		if err == flag.ErrHelp {
 			return
 		}
-		root = os.Args[1]
+		os.Exit(2)
+	}
+	if *showVer || *showVer2 {
+		fmt.Printf("pathsize %s\n", version)
+		return
+	}
+
+	args := fs.Args()
+	// Backward-compatible bare "version"/"help" words.
+	if len(args) > 0 {
+		switch args[0] {
+		case "version":
+			fmt.Printf("pathsize %s\n", version)
+			return
+		case "help":
+			fs.Usage()
+			return
+		}
+	}
+
+	root := "."
+	if len(args) > 0 {
+		root = args[0]
 	}
 	maxLevel := 2
-	if len(os.Args) > 2 {
-		d, err := strconv.Atoi(os.Args[2])
+	if len(args) > 1 {
+		d, err := strconv.Atoi(args[1])
 		if err != nil || d < 1 {
-			fmt.Fprintf(os.Stderr, "invalid depth: %s (must be integer >= 1)\n", os.Args[2])
+			fmt.Fprintf(os.Stderr, "invalid depth: %s (must be integer >= 1)\n", args[1])
 			os.Exit(1)
 		}
 		maxLevel = d
 	}
-	abs, err := filepath.Abs(root)
-	if err == nil {
+
+	minSize, err := parseSize(*minSizeStr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	if abs, err := filepath.Abs(root); err == nil {
 		root = abs
 	}
 	if info, err := os.Stat(root); err != nil || !info.IsDir() {
@@ -349,7 +494,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(initialModel(root, maxLevel), tea.WithAltScreen())
+	// Headless output modes: scan, print, exit (no TUI).
+	if *jsonOut || *noTUI {
+		nodes, err := scan(root, 1, maxLevel)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		var total int64
+		for _, n := range nodes {
+			total += n.size
+		}
+		if *jsonOut {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			if err := enc.Encode(report{Root: root, Total: total, Items: toOut(nodes, minSize)}); err != nil {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			printPlain(os.Stdout, root, total, minSize, nodes)
+		}
+		return
+	}
+
+	p := tea.NewProgram(initialModel(root, maxLevel, minSize), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

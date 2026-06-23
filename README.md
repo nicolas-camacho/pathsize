@@ -34,20 +34,39 @@ Verify downloads against `checksums.txt`.
 ## Usage
 
 ```sh
-pathsize [path] [depth]
+pathsize [flags] [path] [depth]
 ```
 
 - `path` — directory to scan (default `.`, the current directory)
 - `depth` — how many levels to expand, integer `>= 1` (default `2`)
 
+### Flags
+
+| Flag             | Description                                                  |
+| ---------------- | ----------------------------------------------------------- |
+| `-v`, `--version`| print version and exit                                      |
+| `-h`, `--help`   | print help and exit                                         |
+| `--no-tui`       | print results as plain text instead of the TUI              |
+| `--json`         | print results as JSON (implies `--no-tui`)                  |
+| `--min-size S`   | hide entries smaller than `S` (e.g. `10MB`, `500K`, `1.5G`) |
+
+> Flags must come before the positional `path`/`depth` arguments.
+
+The `--no-tui` and `--json` modes run without a terminal UI, so they work in
+pipes, scripts, and non-interactive shells. Size units accept `B`, `K`/`KB`,
+`M`/`MB`, `G`/`GB`, `T`/`TB` (a bare number is bytes).
+
 Examples:
 
 ```sh
-pathsize                 # scan current dir, 2 levels
-pathsize /var/log        # scan /var/log, 2 levels
-pathsize . 4             # scan current dir, 4 levels deep
-pathsize -v              # print version
-pathsize -h              # print help
+pathsize                       # scan current dir, 2 levels (TUI)
+pathsize /var/log              # scan /var/log, 2 levels
+pathsize . 4                   # scan current dir, 4 levels deep
+pathsize --min-size 100MB /    # TUI, hide entries under 100 MB
+pathsize --no-tui . 1          # plain-text listing, one level
+pathsize --json --min-size 1G . 3 > sizes.json   # JSON report
+pathsize -v                    # print version
+pathsize -h                    # print help
 ```
 
 ### Keys
